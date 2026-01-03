@@ -38,7 +38,8 @@ def main():
         index_csv=cfg['data']['index_csv'],
         root_dir=cfg['data']['root'],
         transform=train_transforms,
-        sequence_len=cfg['data']['sequence_len']
+        sequence_len=cfg['data']['sequence_len'],
+        split='train'
     )
     
     train_loader = DataLoader(
@@ -56,7 +57,8 @@ def main():
         pretrained=cfg['model']['pretrained'],
         embed_dim=cfg['model']['embed_dim'],
         num_classes=train_dataset.num_classes,
-        dropout=cfg['model']['dropout']
+        dropout=cfg['model']['dropout'],
+        img_size=tuple(cfg['data']['image_size'])
     ).to(device)
     
     temporal_pool = TemporalPooling().to(device)
@@ -72,6 +74,9 @@ def main():
         weight_decay=cfg['train']['optimizer']['weight_decay']
     )
     
+    # Scaler for AMP
+    scaler = torch.amp.GradScaler('cuda')
+    
     # Scheduler
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
@@ -82,20 +87,43 @@ def main():
     # Training Loop
     print("Starting training...")
     best_loss = float('inf')
-    save_dir = os.path.join("runs", cfg['experiment']['name'], "checkpoints")
+    save_dir = os.path.join(os.getcwd(), "runs", cfg['experiment']['name'], "checkpoints")
     os.makedirs(save_dir, exist_ok=True)
     
+    # Resume logic
+    start_epoch = 0
+    loss_history = []
+    acc_history = []
+    resume_path = os.path.join(save_dir, "last.pth")
+    
+    if os.path.exists(resume_path):
+        print(f"Resuming from checkpoint: {resume_path}")
+        checkpoint = torch.load(resume_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scaler_state_dict' in checkpoint:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        if 'loss_history' in checkpoint:
+            loss_history = checkpoint['loss_history']
+        if 'acc_history' in checkpoint:
+            acc_history = checkpoint['acc_history']
+        print(f"Resuming from epoch {start_epoch}")
+
     # Save resolved config
+    os.makedirs(os.path.dirname(os.path.join("runs", cfg['experiment']['name'], "config_resolved.yaml")), exist_ok=True)
     with open(os.path.join("runs", cfg['experiment']['name'], "config_resolved.yaml"), 'w') as f:
         yaml.dump(cfg, f)
         
-    for epoch in range(cfg['train']['epochs']):
+    for epoch in range(start_epoch, cfg['train']['epochs']):
         model.train()
         temporal_pool.train()
         
         total_loss = 0
         total_ce = 0
         total_tri = 0
+        total_correct = 0
+        total_samples = 0
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg['train']['epochs']}")
         
@@ -109,34 +137,35 @@ def main():
             # Flatten for backbone: [B*T, C, H, W]
             frames_flat = frames.view(B*T, C, H, W)
             
-            # Forward backbone
-            features_flat, cls_scores_flat = model(frames_flat, return_logits=True) # [B*T, d], [B*T, num_classes]
-            
-            # Reshape features: [B, T, d]
-            features = features_flat.view(B, T, -1)
-            
-            # Temporal Pooling
-            seq_embedding = temporal_pool(features) # [B, d]
-            
-            # For CE loss, we can use the average of cls_scores or just use the embedding to classify?
-            # Usually in ReID with ViT, we use the CLS token of each frame or average them.
-            # Here, the model returns cls_scores for each frame.
-            # Let's average the cls_scores over time for the sequence prediction?
-            # Or simpler: use the seq_embedding to predict class (requires another classifier layer).
-            # BUT, the ViTEmbedder has a classifier layer that works on frame features.
-            # Let's use the average of frame-level logits for CE loss.
-            
-            cls_scores = cls_scores_flat.view(B, T, -1).mean(dim=1) # [B, num_classes]
-            
-            # Calculate Losses
-            loss_ce = criterion_ce(cls_scores, labels)
-            loss_tri = criterion_tri(seq_embedding, labels)
-            
-            loss = cfg['loss']['ce']['weight'] * loss_ce + cfg['loss']['triplet']['weight'] * loss_tri
-            
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            
+            with torch.amp.autocast('cuda'):
+                # Forward backbone
+                features_flat, cls_scores_flat = model(frames_flat, return_logits=True) # [B*T, d], [B*T, num_classes]
+                
+                # Reshape features: [B, T, d]
+                features = features_flat.view(B, T, -1)
+                
+                # Temporal Pooling
+                seq_embedding = temporal_pool(features) # [B, d]
+                
+                cls_scores = cls_scores_flat.view(B, T, -1).mean(dim=1) # [B, num_classes]
+                
+                # Calculate Losses
+                loss_ce = criterion_ce(cls_scores, labels)
+                loss_tri = criterion_tri(seq_embedding, labels)
+                
+                loss = cfg['loss']['ce']['weight'] * loss_ce + cfg['loss']['triplet']['weight'] * loss_tri
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            # Calculate Accuracy
+            _, preds = torch.max(cls_scores, 1)
+            correct = (preds == labels).sum().item()
+            total_correct += correct
+            total_samples += labels.size(0)
             
             total_loss += loss.item()
             total_ce += loss_ce.item()
@@ -146,20 +175,29 @@ def main():
                 'loss': total_loss / (batch_idx + 1),
                 'ce': total_ce / (batch_idx + 1),
                 'tri': total_tri / (batch_idx + 1),
+                'acc': total_correct / total_samples,
                 'lr': optimizer.param_groups[0]['lr']
             })
             
         scheduler.step()
         
         avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1} finished. Avg Loss: {avg_loss:.4f}")
+        avg_acc = total_correct / total_samples
+        print(f"Epoch {epoch+1} finished. Avg Loss: {avg_loss:.4f}, Avg Acc: {avg_acc:.4f}")
+        
+        loss_history.append(avg_loss)
+        acc_history.append(avg_acc)
         
         # Save checkpoint
+        os.makedirs(save_dir, exist_ok=True)
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
             'loss': avg_loss,
+            'loss_history': loss_history,
+            'acc_history': acc_history
         }, os.path.join(save_dir, "last.pth"))
         
         if avg_loss < best_loss:
@@ -168,9 +206,37 @@ def main():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scaler_state_dict': scaler.state_dict(),
                 'loss': avg_loss,
+                'loss_history': loss_history,
+                'acc_history': acc_history
             }, os.path.join(save_dir, "best.pth"))
             print(f"New best model saved with loss {best_loss:.4f}")
+            
+        # Plotting
+        if (epoch + 1) % cfg['train'].get('plot_freq', 10) == 0:
+            try:
+                import matplotlib.pyplot as plt
+                
+                # Loss Plot
+                plt.figure()
+                plt.plot(loss_history)
+                plt.title('Training Loss')
+                plt.xlabel('Epoch')
+                plt.ylabel('Loss')
+                plt.savefig(os.path.join(save_dir, 'loss.png'))
+                plt.close()
+                
+                # Accuracy Plot
+                plt.figure()
+                plt.plot(acc_history)
+                plt.title('Training Accuracy')
+                plt.xlabel('Epoch')
+                plt.ylabel('Accuracy')
+                plt.savefig(os.path.join(save_dir, 'accuracy.png'))
+                plt.close()
+            except Exception as e:
+                print(f"Error plotting: {e}")
 
 if __name__ == "__main__":
     main()

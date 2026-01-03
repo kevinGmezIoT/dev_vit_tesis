@@ -1,12 +1,12 @@
 experiment:
-  name: vit_mars_seqavg
+  name: vit_mars_seqavg_1
 
 data:
-  root: data/mars/processed
-  index_csv: data/mars/processed/index.csv
+  root: /content/data/mars-processed
+  index_csv: /content/data/mars-processed/index.csv
   image_size: [256, 128]     # [H, W]
   sequence_len: 25
-  num_workers: 4
+  num_workers: 1
 
 model:
   backbone: vit_base_patch16_224   # timm name (puedes usar vit_small_patch16_224)
@@ -17,8 +17,9 @@ model:
 train:
   epochs: 60
   batch:
-    P: 16          # identidades por batch
-    K: 4           # secuencias por identidad
+    P: 4           # identidades por batch
+    K: 2           # secuencias por identidad
+  plot_freq: 10    # frecuencia de ploteo en epocas
   optimizer:
     name: adamw
     lr: 0.0001

@@ -8,8 +8,15 @@ import numpy as np
 from collections import defaultdict
 
 class MARSDataset(Dataset):
-    def __init__(self, index_csv, root_dir, transform=None, sequence_len=25):
+    def __init__(self, index_csv, root_dir, transform=None, sequence_len=25, split='train'):
         self.df = pd.read_csv(index_csv)
+        
+        if split is not None:
+            if 'split' in self.df.columns:
+                self.df = self.df[self.df['split'] == split].reset_index(drop=True)
+            else:
+                print(f"Warning: 'split' column not found in {index_csv}. Using all data.")
+        
         self.root_dir = root_dir
         self.transform = transform
         self.sequence_len = sequence_len
@@ -29,12 +36,13 @@ class MARSDataset(Dataset):
         label = self.pid2label[pid]
         
         # Load frames
-        frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
+        full_frames_dir = os.path.join(self.root_dir, frames_dir)
+        frame_paths = sorted(glob.glob(os.path.join(full_frames_dir, "*.jpg")))
         
         # Handle sequence length
         num_frames = len(frame_paths)
         if num_frames == 0:
-            raise ValueError(f"No frames found in {frames_dir}")
+            raise ValueError(f"No frames found in {full_frames_dir}")
             
         if num_frames < self.sequence_len:
             # Pad with last frame
@@ -89,12 +97,12 @@ class RandomIdentitySampler(Sampler):
         batch_idxs_dict = defaultdict(list)
 
         for pid in self.pids:
-            idxs = self.index_dic[pid]
+            idxs = list(self.index_dic[pid])
             if len(idxs) < self.num_instances:
                 idxs = np.random.choice(idxs, size=self.num_instances, replace=True)
             
             np.random.shuffle(idxs)
-            batch_idxs_dict[pid] = idxs
+            batch_idxs_dict[pid] = list(idxs)
 
         avai_pids = list(self.index_dic.keys())
         final_idxs = []

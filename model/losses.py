@@ -36,8 +36,28 @@ class TripletLoss(nn.Module):
         mask = targets.expand(n, n).eq(targets.expand(n, n).t())
         dist_ap, dist_an = [], []
         for i in range(n):
-            dist_ap.append(dist[i][mask[i]].max().unsqueeze(0))
-            dist_an.append(dist[i][mask[i] == 0].min().unsqueeze(0))
+            # Positives: same identity. 
+            # We exclude the anchor itself by checking the distance > 0? 
+            # Actually, standard Triplet Loss includes the anchor in the mask, 
+            # but we want the hardest positive that is NOT the anchor.
+            # For simplicity and to avoid errors, we'll just take the max of all same-identity samples.
+            pos_dists = dist[i][mask[i]]
+            if pos_dists.numel() > 0:
+                dist_ap.append(pos_dists.max().unsqueeze(0))
+            else:
+                # If no positives (should not happen with K>=1), use 0
+                dist_ap.append(torch.tensor([0.0], device=dist.device))
+
+            # Negatives: different identities
+            neg_dists = dist[i][mask[i] == 0]
+            if neg_dists.numel() > 0:
+                dist_an.append(neg_dists.min().unsqueeze(0))
+            else:
+                # If no negatives in batch, use a large value so it doesn't contribute to loss
+                # or just use dist_ap[-1] + margin to make loss 0
+                print(f"Warning: No negatives found in batch for anchor with label {targets[i].item()}. This happens when a batch contains only one identity.")
+                dist_an.append(dist_ap[-1] + self.margin)
+
         dist_ap = torch.cat(dist_ap)
         dist_an = torch.cat(dist_an)
 

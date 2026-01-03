@@ -1,2 +1,4 @@
 data/
 notebooks/
+outputs/
+__pycache__/

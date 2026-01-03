@@ -1,187 +1,249 @@
-import os
 import argparse
-import pandas as pd
+import json
+import re
 import shutil
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
 from tqdm import tqdm
-import glob
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Prepare MARS dataset")
-    parser.add_argument("--raw_root", type=str, required=True, help="Path to raw MARS dataset")
-    parser.add_argument("--out_root", type=str, required=True, help="Path to processed MARS dataset")
-    parser.add_argument("--sequence_len", type=int, default=25, help="Length of sequence")
-    parser.add_argument("--overlap", type=int, default=10, help="Overlap between sequences")
-    return parser.parse_args()
 
-def process_tracklet(tracklet_path, out_dir, sequence_len, overlap, person_id, cam_id, tracklet_id):
-    frames = sorted(glob.glob(os.path.join(tracklet_path, "*.jpg")))
-    num_frames = len(frames)
-    
-    if num_frames < sequence_len:
-        # If tracklet is shorter than sequence_len, we can either skip it or pad it.
-        # For now, let's skip very short tracklets or just take what we have if we handle variable length.
-        # But the requirement is fixed length. Let's replicate frames if needed or just skip.
-        # Strategy: Loop/Repeat frames to reach sequence_len
-        pass 
+def natural_sort_key(s: str):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"([0-9]+)", str(s))]
 
-    sequences = []
-    
-    # Generate sequences
-    step = sequence_len - overlap
-    if step < 1: step = 1
-    
-    for i in range(0, num_frames, step):
-        end = i + sequence_len
-        if end > num_frames:
-            if i == 0: # Special case: short tracklet, take all and pad/repeat later in dataset or here
-                 seq_frames = frames
-            else:
-                break # Ignore tail if not enough frames
-        else:
-            seq_frames = frames[i:end]
-        
-        if len(seq_frames) < sequence_len:
-             # Pad by repeating last frame? Or just ignore.
-             # Let's ignore tails for now unless it's the only sequence.
-             if num_frames >= sequence_len:
-                 continue
 
-        # Create sequence directory
-        seq_name = f"cam{cam_id}_seq{tracklet_id}_{i:04d}"
-        seq_dir = os.path.join(out_dir, seq_name, "rgb")
-        os.makedirs(seq_dir, exist_ok=True)
-        
-        # Copy frames
-        for j, frame_path in enumerate(seq_frames):
-            shutil.copy(frame_path, os.path.join(seq_dir, f"frame{j:04d}.jpg"))
-            
-        sequences.append({
-            "person_id": person_id,
-            "camera_id": cam_id,
-            "sequence_id": f"{tracklet_id}_{i:04d}",
-            "frames_dir": seq_dir,
-            "num_frames": len(seq_frames)
-        })
-        
-    return sequences
+def rel_to_out_root(out_root: Path, path: Path) -> str:
+    return path.resolve().relative_to(out_root.resolve()).as_posix()
+
+
+def parse_mars_filename(fname: str) -> Optional[Tuple[str, int, int, int]]:
+    """
+    Parse de: 0001C1T0001F001.jpg
+    Retorna: (pid_str, cam_int, tracklet_int, frame_int)
+    """
+    m = re.match(
+        r"(?P<pid>\d+)"
+        r"C(?P<cam>\d+)"
+        r"T(?P<trk>\d+)"
+        r"F(?P<frm>\d+)\.jpg$",
+        fname,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    return m.group("pid"), int(m.group("cam")), int(m.group("trk")), int(m.group("frm"))
+
+
+def mars_pid_to_iddir(pid_str: str) -> str:
+    return f"ID{int(pid_str):04d}"
+
+
+def cam_to_cxxx(cam_int: int) -> str:
+    return f"c{cam_int:03d}"
+
+
+def tracklet_to_scene(tracklet_id: int, width: int = 4) -> str:
+    """
+    Convierte tracklet a scene:
+      T0001 -> S0001 (width=4)
+    """
+    return f"S{tracklet_id:0{width}d}"
+
+
+def build_cycles_from_sorted_frames(
+    frames: List[Tuple[int, Path]],
+    seq_length: int,
+    overlap: int,
+) -> List[List[Tuple[int, Path]]]:
+    if len(frames) < seq_length:
+        return []
+    step = seq_length - overlap
+    if step <= 0:
+        step = 1
+    cycles: List[List[Tuple[int, Path]]] = []
+    for i in range(0, len(frames) - seq_length + 1, step):
+        chunk = frames[i:i + seq_length]
+        if len(chunk) == seq_length:
+            cycles.append(chunk)
+    return cycles
+
+
+def copy_cycle_rgb(
+    cycle: List[Tuple[int, Path]],
+    dst_cycle_dir: Path,
+    overwrite: bool,
+) -> Tuple[List[int], List[Path]]:
+    dst_cycle_dir.mkdir(parents=True, exist_ok=True)
+    frame_nums: List[int] = []
+    dst_paths: List[Path] = []
+
+    for fn, src in cycle:
+        dst = dst_cycle_dir / f"{fn:06d}.jpg"
+        if overwrite or (not dst.exists()):
+            shutil.copy2(src, dst)
+        frame_nums.append(fn)
+        dst_paths.append(dst)
+
+    return frame_nums, dst_paths
+
 
 def main():
-    args = parse_args()
-    
-    if not os.path.exists(args.raw_root):
-        print(f"Error: Raw root {args.raw_root} does not exist.")
-        return
+    ap = argparse.ArgumentParser(description="Organiza MARS a estructura tipo tu dataset (solo RGB) y genera CSVs.")
+    ap.add_argument("--raw-root", required=True, help="Raíz MARS crudo (contiene bbox_train, bbox_test).")
+    ap.add_argument("--out-root", required=True, help="Raíz de salida (crea rgb/ y metadata/).")
+    ap.add_argument("--sequence-len", type=int, default=25)
+    ap.add_argument("--overlap", type=int, default=10)
+    ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--skip-existing-cycles", action="store_true")
 
-    # MARS structure usually: bbox_train/ID/tracklet/*.jpg
-    # We assume a structure like: raw_root/bbox_train/0001/0001C1T0001/*.jpg
-    # Adjust based on actual MARS structure. 
-    # Standard MARS: bbox_train/xxxx/xxxxCxsxxxx.jpg (all in one folder per ID? or subfolders?)
-    # Actually MARS 'bbox_train' has subfolders per ID. Inside ID, there are images.
-    # Filename format: 0001C1T0001F001.jpg -> ID, Cam, Tracklet, Frame.
-    # We need to group by Tracklet.
-    
-    # Let's assume the user puts 'bbox_train' and 'bbox_test' inside raw_root.
-    
-    splits = ['bbox_train', 'bbox_test']
-    all_sequences = []
-    
-    for split in splits:
-        split_dir = os.path.join(args.raw_root, split)
-        if not os.path.exists(split_dir):
-            print(f"Warning: {split_dir} not found. Skipping.")
+    # Esta opción controla el padding del scene: S0001 vs S01
+    ap.add_argument("--scene-width", type=int, default=4, help="Ancho numérico de escena derivada de tracklet (default=4).")
+
+    # Debug/test
+    ap.add_argument("--debug", action="store_true", help="Procesa solo los primeros 2 IDs por split.")
+    ap.add_argument("--limit-cycles", type=int, default=None, help="Limita total de ciclos generados.")
+
+    args = ap.parse_args()
+
+    raw_root = Path(args.raw_root).expanduser().resolve()
+    out_root = Path(args.out_root).expanduser().resolve()
+
+    if not raw_root.exists():
+        raise FileNotFoundError(f"No existe raw-root: {raw_root}")
+
+    rgb_out_root = out_root / "rgb"
+    meta_out_root = out_root / "metadata"
+    meta_out_root.mkdir(parents=True, exist_ok=True)
+
+    sequences_rows: List[Dict] = []
+    frames_rows: List[Dict] = []
+    total_cycles = 0
+
+    splits = [("bbox_train", "train"), ("bbox_test", "test")]
+
+    for split_dirname, split_name in splits:
+        split_dir = raw_root / split_dirname
+        if not split_dir.is_dir():
+            print(f"[WARN] No existe {split_dir}, se omite.")
             continue
-            
-        print(f"Processing {split}...")
-        
-        # Iterate over IDs
-        person_ids = sorted(os.listdir(split_dir))
-        
-        for pid in tqdm(person_ids):
-            pid_path = os.path.join(split_dir, pid)
-            if not os.path.isdir(pid_path): continue
-            
-            # In MARS, images are usually directly in the ID folder.
-            # We need to group them by tracklet.
-            # Filename: {ID}C{Cam}T{Tracklet}F{Frame}.jpg
-            # Example: 0001C1T0001F001.jpg
-            
-            images = sorted(glob.glob(os.path.join(pid_path, "*.jpg")))
-            tracklets = {}
-            
-            for img_path in images:
-                fname = os.path.basename(img_path)
-                # Parse filename
-                # 0001 C1 T0001 F001 .jpg
-                # ID: 0-4
-                # Cam: 5-6 (C1)
-                # Tracklet: 7-11 (T0001)
-                # Frame: 12-15 (F001)
-                
-                try:
-                    cam_str = fname[4:6] # C1
-                    track_str = fname[6:11] # T0001
-                    track_key = f"{cam_str}_{track_str}"
-                    
-                    if track_key not in tracklets:
-                        tracklets[track_key] = []
-                    tracklets[track_key].append(img_path)
-                except:
-                    print(f"Skipping malformed file: {fname}")
+
+        person_dirs = sorted([p for p in split_dir.iterdir() if p.is_dir()], key=lambda p: natural_sort_key(p.name))
+        if args.debug:
+            person_dirs = person_dirs[:2]
+            print(f"[DEBUG] {split_name}: procesando solo {len(person_dirs)} IDs.")
+
+        print(f"\nProcesando split {split_name} ({split_dirname}) ...")
+
+        for pid_dir in tqdm(person_dirs, desc=f"{split_name} IDs", unit="id"):
+            tracklets: Dict[Tuple[int, int], List[Tuple[int, Path]]] = {}
+
+            jpgs = sorted(pid_dir.glob("*.jpg"), key=lambda p: natural_sort_key(p.name))
+            for img_path in jpgs:
+                parsed = parse_mars_filename(img_path.name)
+                if parsed is None:
+                    continue
+                pid_str, cam_int, trk_int, frm_int = parsed
+                tracklets.setdefault((cam_int, trk_int), []).append((frm_int, img_path))
+
+            if not tracklets:
+                continue
+
+            id_dirname = mars_pid_to_iddir(pid_dir.name)  # pid_dir.name suele ser "0001"
+            person_global_id = int(pid_dir.name)
+
+            for (cam_int, trk_int), frames in tracklets.items():
+                frames_sorted = sorted(frames, key=lambda x: x[0])
+                cycles = build_cycles_from_sorted_frames(
+                    frames=frames_sorted,
+                    seq_length=args.sequence_len,
+                    overlap=args.overlap,
+                )
+                if not cycles:
                     continue
 
-            # Process each tracklet
-            split_name = 'train' if 'train' in split else 'test'
-            # Create ID dir in processed
-            id_out_dir = os.path.join(args.out_root, split_name, pid)
-            os.makedirs(id_out_dir, exist_ok=True)
-            
-            for t_key, t_frames in tracklets.items():
-                # Sort frames just in case
-                t_frames.sort()
-                
-                # Create a temp dir for the tracklet to reuse existing logic or just modify logic
-                # Let's just pass the list of frames to a modified process function or handle here.
-                
-                # Logic to split tracklet into sequences
-                num_frames = len(t_frames)
-                step = args.sequence_len - args.overlap
-                if step < 1: step = 1
-                
-                # If tracklet is too short, we might skip or keep it as one sequence (padding handled in dataset)
-                if num_frames < args.sequence_len:
-                    # Keep as one sequence
-                    indices = [0]
-                else:
-                    indices = range(0, num_frames - args.sequence_len + 1, step)
-                
-                for i in indices:
-                    if num_frames < args.sequence_len:
-                        seq_frames = t_frames # Take all
-                        suffix = "full"
-                    else:
-                        seq_frames = t_frames[i : i + args.sequence_len]
-                        suffix = f"{i:04d}"
-                    
-                    seq_name = f"{t_key}_{suffix}"
-                    seq_dir = os.path.join(id_out_dir, seq_name, "rgb")
-                    os.makedirs(seq_dir, exist_ok=True)
-                    
-                    for j, fpath in enumerate(seq_frames):
-                        shutil.copy(fpath, os.path.join(seq_dir, f"frame{j:04d}.jpg"))
-                        
-                    all_sequences.append({
-                        "split": split_name,
-                        "person_id": pid,
-                        "camera_id": t_key.split('_')[0], # C1
-                        "sequence_id": seq_name,
-                        "frames_dir": seq_dir,
-                        "num_frames": len(seq_frames)
+                cam = cam_to_cxxx(cam_int)
+                scene = tracklet_to_scene(trk_int, width=args.scene_width)  # <-- CAMBIO CLAVE
+
+                for cyc_idx, cycle in enumerate(cycles, start=1):
+                    total_cycles += 1
+                    cycle_dir = f"cycle{cyc_idx:04d}"
+                    dst_cycle_dir = rgb_out_root / id_dirname / scene / cam / cycle_dir
+
+                    if args.skip_existing_cyles if False else False:
+                        pass  # no-op para evitar typos accidentales
+
+                    if args.skip_existing_cycles and dst_cycle_dir.exists():
+                        if args.limit_cycles is not None and total_cycles >= int(args.limit_cycles):
+                            break
+                        continue
+
+                    frame_nums, dst_paths = copy_cycle_rgb(
+                        cycle=cycle,
+                        dst_cycle_dir=dst_cycle_dir,
+                        overwrite=args.overwrite,
+                    )
+
+                    sequence_id = f"{id_dirname}_{scene}_{cam}_cyc{cyc_idx:04d}"
+
+                    sequences_rows.append({
+                        "sequence_id": sequence_id,
+                        "person_global_id": person_global_id,
+                        "dataset": "MARS",
+                        "split": split_name,  # si luego lo quieres quitar, lo elimino
+                        "scene": scene,
+                        "cam_id": cam,
+                        "tracklet_id": trk_int,
+                        "cycle_index": cyc_idx,
+                        "rgb_dir": rel_to_out_root(out_root, dst_cycle_dir),
+                        "num_frames": len(frame_nums),
+                        "frame_start": int(frame_nums[0]),
+                        "frame_end": int(frame_nums[-1]),
+                        "frame_numbers_json": json.dumps(frame_nums, ensure_ascii=False),
                     })
 
-    # Save index
-    df = pd.DataFrame(all_sequences)
-    df.to_csv(os.path.join(args.out_root, "index.csv"), index=False)
-    print(f"Saved index to {os.path.join(args.out_root, 'index.csv')}")
+                    for fn, dst in zip(frame_nums, dst_paths):
+                        frames_rows.append({
+                            "sequence_id": sequence_id,
+                            "person_global_id": person_global_id,
+                            "scene": scene,
+                            "cam_id": cam,
+                            "tracklet_id": trk_int,
+                            "cycle_index": cyc_idx,
+                            "frame_number": int(fn),
+                            "rgb_path": rel_to_out_root(out_root, dst),
+                        })
+
+                    if args.limit_cycles is not None and total_cycles >= int(args.limit_cycles):
+                        break
+
+                if args.limit_cycles is not None and total_cycles >= int(args.limit_cycles):
+                    break
+
+            if args.limit_cycles is not None and total_cycles >= int(args.limit_cycles):
+                break
+
+        if args.limit_cycles is not None and total_cycles >= int(args.limit_cycles):
+            break
+
+    if not sequences_rows:
+        print("\n[WARN] No se generaron secuencias. Revisa que bbox_train/bbox_test existan y los nombres correspondan.")
+        return
+
+    seq_df = pd.DataFrame(sequences_rows)
+    frm_df = pd.DataFrame(frames_rows)
+
+    seq_csv = meta_out_root / "sequences.csv"
+    frm_csv = meta_out_root / "sequence_frames.csv"
+
+    seq_df.to_csv(seq_csv, index=False, encoding="utf-8")
+    frm_df.to_csv(frm_csv, index=False, encoding="utf-8")
+
+    print("\nOK:")
+    print(f"- RGB root:            {rgb_out_root}")
+    print(f"- sequences.csv:       {seq_csv} (secuencias: {len(seq_df)})")
+    print(f"- sequence_frames.csv: {frm_csv} (frames: {len(frm_df)})")
+
 
 if __name__ == "__main__":
     main()

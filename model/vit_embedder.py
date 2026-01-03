@@ -4,11 +4,11 @@ import torch.nn.functional as F
 import timm
 
 class ViTEmbedder(nn.Module):
-    def __init__(self, backbone_name, pretrained=True, embed_dim=512, num_classes=0, dropout=0.0):
+    def __init__(self, backbone_name, pretrained=True, embed_dim=512, num_classes=0, dropout=0.0, img_size=None):
         super().__init__()
         
         # Create backbone
-        self.backbone = timm.create_model(backbone_name, pretrained=pretrained, num_classes=0)
+        self.backbone = timm.create_model(backbone_name, pretrained=pretrained, num_classes=0, img_size=img_size)
         
         # Get feature dim
         if hasattr(self.backbone, 'num_features'):
@@ -54,7 +54,7 @@ class ViTEmbedder(nn.Module):
         
         bn_features = self.bottleneck(features)
         
-        if self.training and return_logits:
+        if return_logits:
             cls_score = self.classifier(bn_features)
             return features, cls_score
         
