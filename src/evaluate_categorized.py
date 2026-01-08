@@ -49,12 +49,18 @@ def main():
         num_workers=cfg['data']['num_workers']
     )
     
-    # Initialize Model
-    # We need num_classes correctly, usually from train set. 
-    # For evaluation, we can peek at the checkpoint if needed, but here we assume MyDataset knows all pids if split=None
-    # However, to be safe, let's load all data briefly to count classes
-    full_dataset = MyDataset(args.input_csv, cfg['data']['root'], split=None)
-    num_classes = full_dataset.num_classes
+    # Load Checkpoint first to get correct num_classes
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    state_dict = checkpoint['model_state_dict']
+    
+    # Infer num_classes from classifier weight shape
+    if 'classifier.weight' in state_dict:
+        num_classes = state_dict['classifier.weight'].shape[0]
+        print(f"Inferred {num_classes} classes from checkpoint.")
+    else:
+        # Fallback to dataset if not found (unexpected for these models)
+        full_dataset = MyDataset(args.input_csv, cfg['data']['root'], split=None)
+        num_classes = full_dataset.num_classes
     
     if args.arch == 'vit':
         model = ViTEmbedder(
@@ -72,8 +78,7 @@ def main():
             num_classes=num_classes
         )
         
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
     
